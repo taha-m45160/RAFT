@@ -19,7 +19,9 @@ package raft
 
 import (
 	"labrpc"
+	"math/rand"
 	"sync"
+	"time"
 )
 
 // import "bytes"
@@ -44,21 +46,26 @@ type Raft struct {
 	mu        sync.Mutex
 	peers     []*labrpc.ClientEnd
 	persister *Persister
-	me        int // index into peers[]
+	me        int      // index into peers[]
+	heartBeat chan int // for sending heartbeats
+	begin     chan int // for starting election
 
-	// Your data here.
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	// persistent state
+	currentTerm int  // latest term that this server has seen
+	votedFor    int  // candidate id of the server that this server voted for in current term
+	isLeader    bool // whether this server thinks it is the leader
 
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
-	// Your code here.
+
+	isleader = rf.isLeader
+	term = rf.currentTerm
+
 	return term, isleader
 }
 
@@ -119,7 +126,9 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here.
+}
+
+func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 }
 
 //
@@ -139,8 +148,13 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -160,7 +174,7 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := false
 
 	return index, term, isLeader
 }
@@ -186,17 +200,51 @@ func (rf *Raft) Kill() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
 	// Your initialization code here.
+	rf.isLeader = false
+	rf.currentTerm = 0
+	rf.votedFor = 0
+
+	rf.begin = make(chan int)
+	rf.heartBeat = make(chan int)
+
+	// spawn necessary goroutines
+	go startElection(rf.begin)
+	go electionTimer(rf.heartBeat)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
+}
+
+func electionTimer(heartBeat chan int) {
+	rand.Seed(time.Now().UnixNano())
+	min := 300
+	max := 600
+
+	for {
+		select {
+		case <-time.After(time.Duration(rand.Intn(max-min)+min) * time.Millisecond):
+			// milord is no more
+		case <-heartBeat:
+			// thou art alive milord, reset timer
+			continue
+		}
+	}
+}
+
+func startElection(begin chan int) {
+	for {
+		select {
+		case <-begin:
+			// who shall be our king
+		}
+	}
 }
