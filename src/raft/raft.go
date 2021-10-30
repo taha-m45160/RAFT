@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -12,6 +13,25 @@ type ApplyMsg struct {
 	Command     interface{}
 	UseSnapshot bool   // ignore for Assignment2; only used in Assignment3
 	Snapshot    []byte // ignore for Assignment2; only used in Assignment3
+}
+
+type AppendEntriesArgs struct {
+	Term     int // leader term
+	LeaderID int // leader id
+}
+
+type AppendEntriesReply struct {
+	Term int // receiver term
+}
+
+type RequestVoteArgs struct {
+	Term        int // candidate term
+	CandidateID int // candidate id
+}
+
+type RequestVoteReply struct {
+	Term        int  // receiver term
+	VoteGranted bool // true if vote granted false otherwise
 }
 
 /*a single RAFT peer object*/
@@ -29,6 +49,7 @@ type Raft struct {
 	voteCount     int
 	voteRequested chan int
 	heartBeat     chan int
+	legitimate    chan bool
 }
 
 func (rf *Raft) GetState() (int, bool) {
@@ -56,25 +77,6 @@ func (rf *Raft) persist() {
 func (rf *Raft) readPersist(data []byte) {
 }
 
-type AppendEntriesArgs struct {
-	Term     int // leader term
-	LeaderID int // leader id
-}
-
-type AppendEntriesReply struct {
-	Term int // receiver term
-}
-
-type RequestVoteArgs struct {
-	Term        int // candidate term
-	CandidateID int // candidate id
-}
-
-type RequestVoteReply struct {
-	Term        int  // receiver term
-	VoteGranted bool // true if vote granted false otherwise
-}
-
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
@@ -98,6 +100,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.votedFor = -1
 	rf.voteRequested = make(chan int)
 	rf.heartBeat = make(chan int)
+	rf.legitimate = make(chan bool)
 
 	// spawn necessary goroutines
 	go nodeMain(rf, me)
@@ -106,58 +109,6 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
-}
-
-/*election process conducted upon leader failure*/
-func election(rf *Raft) {
-	rf.mu.Lock()
-	rf.currentTerm += 1
-	term := rf.currentTerm
-	rf.voteCount += 1
-	totalPeers := len(rf.peers)
-	rf.mu.Unlock()
-
-	storeReplies := make(map[int]*RequestVoteReply)
-	Args := RequestVoteArgs{term, rf.me}
-
-	// request votes
-	for i := 0; i < totalPeers; i++ {
-		if i != rf.me {
-			storeReplies[i] = new(RequestVoteReply)
-			go rf.sendRequestVote(i, Args, storeReplies[i])
-		}
-	}
-
-	// wait for election to complete or timeout
-	loop := true
-	ch := make(chan bool)
-	h := false
-	go timer(ch, h)
-
-	for loop {
-		select {
-		case loop = <-ch:
-			continue
-		default:
-			rf.mu.Lock()
-			status := rf.voteCount
-			rf.mu.Unlock()
-
-			if status > (totalPeers / 2) {
-				// become Leader
-				rf.mu.Lock()
-				rf.state = "leader"
-				rf.mu.Unlock()
-
-				loop = false
-				continue
-			}
-		}
-	}
-
-	rf.mu.Lock()
-	rf.voteCount = 0
-	rf.mu.Unlock()
 }
 
 /*request vote rpc received and reply dispatched*/
@@ -182,6 +133,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 
 		rf.mu.Lock()
 		rf.currentTerm = args.Term
+		rf.state = "follower"
 		rf.votedFor = args.CandidateID
 		rf.mu.Unlock()
 	}
@@ -195,12 +147,20 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 	if currentTerm > args.Term {
 		// received appendEntries from old leader
+		// return newer term
 		reply.Term = currentTerm
 
 	} else {
 		// heartBeat received
 		rf.mu.Lock()
 		rf.currentTerm = args.Term
+		rf.state = "follower"
+
+		// if candidate and heartbeat received from legitimate leader
+		// then cancel election and revert to follower
+		if rf.state == "candidate" {
+			rf.legitimate <- false
+		}
 		rf.mu.Unlock()
 
 		rf.heartBeat <- 1
@@ -243,6 +203,7 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 			rf.state = "follower"
 		}
 		rf.mu.Unlock()
+
 	} else {
 		rf.mu.Lock()
 		rf.state = "follower"
@@ -252,11 +213,11 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 	return ok
 }
 
-/*return false when the timer runs out*/
+/*return false when timer runs out*/
 func timer(timeout chan bool, heartBeat bool) bool {
 	if !heartBeat {
 		rand.Seed(time.Now().UnixNano())
-		min := 350
+		min := 450
 		max := 600
 		dur := rand.Intn(max-min) + min
 
@@ -267,7 +228,7 @@ func timer(timeout chan bool, heartBeat bool) bool {
 
 	} else {
 		rand.Seed(time.Now().UnixNano())
-		time.Sleep(40 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 
 		return false
 	}
@@ -293,10 +254,10 @@ func heartBeat(rf *Raft) {
 	}
 }
 
-/*RAFT peer main process*/
+/*main RAFT peer process*/
 func nodeMain(rf *Raft, me int) {
 	rand.Seed(time.Now().UnixNano())
-	min := 350
+	min := 450
 	max := 600
 
 	for {
@@ -306,6 +267,7 @@ func nodeMain(rf *Raft, me int) {
 
 		switch state {
 		case "follower":
+			fmt.Println("follower", rf.me)
 			select {
 			case <-time.After(time.Duration(rand.Intn(max-min)+min) * time.Millisecond):
 				// leader timed out
@@ -318,12 +280,68 @@ func nodeMain(rf *Raft, me int) {
 				// timeout reset
 			}
 		case "candidate":
+			fmt.Println("CANDIDATE", rf.me)
 			election(rf)
 		case "leader":
+			fmt.Println("LEADER", rf.me)
 			heartBeat(rf)
 			t := make(chan bool)
 			h := true
 			timer(t, h)
 		}
 	}
+}
+
+/*election process conducted upon leader failure*/
+func election(rf *Raft) {
+	rf.mu.Lock()
+	rf.currentTerm += 1
+	term := rf.currentTerm
+	rf.voteCount += 1
+	totalPeers := len(rf.peers)
+	rf.mu.Unlock()
+
+	storeReplies := make(map[int]*RequestVoteReply)
+	Args := RequestVoteArgs{term, rf.me}
+
+	// request votes
+	for i := 0; i < totalPeers; i++ {
+		if i != rf.me {
+			storeReplies[i] = new(RequestVoteReply)
+			go rf.sendRequestVote(i, Args, storeReplies[i])
+		}
+	}
+
+	// wait for election to complete or timeout
+	loop := true
+	ch := make(chan bool)
+	h := false
+	go timer(ch, h)
+
+	for loop {
+		select {
+		case loop = <-ch:
+			continue
+		case loop = <-rf.legitimate:
+			continue
+		default:
+			rf.mu.Lock()
+			status := rf.voteCount
+			rf.mu.Unlock()
+
+			if status > (totalPeers / 2) {
+				// become Leader
+				rf.mu.Lock()
+				rf.state = "leader"
+				rf.mu.Unlock()
+
+				loop = false
+				continue
+			}
+		}
+	}
+
+	rf.mu.Lock()
+	rf.voteCount = 0
+	rf.mu.Unlock()
 }
