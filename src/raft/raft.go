@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -46,15 +47,18 @@ type Raft struct {
 	mu        sync.Mutex
 	peers     []*labrpc.ClientEnd
 	persister *Persister
-	me        int      // index into peers[]
-	heartBeat chan int // for sending heartbeats
-	begin     chan int // for starting election
+	me        int // index into peers[]
 
 	// persistent state
-	currentTerm int  // latest term that this server has seen
-	votedFor    int  // candidate id of the server that this server voted for in current term
-	isLeader    bool // whether this server thinks it is the leader
+	currentTerm int    // latest term that this server has seen
+	votedFor    int    // candidate id of the server that this server voted for in current term
+	state       string // whether the node is a follower, candidate, or leader
 
+	voteCount      int
+	voteRequested  chan int
+	isLeader       chan int
+	heartBeat      chan int
+	closeHeartBeat chan int
 }
 
 // return currentTerm and whether this server
@@ -63,8 +67,17 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 
-	isleader = rf.isLeader
+	rf.mu.Lock()
+	state := rf.state
 	term = rf.currentTerm
+	rf.mu.Unlock()
+
+	if state == "leader" {
+		isleader = true
+
+	} else {
+		isleader = false
+	}
 
 	return term, isleader
 }
@@ -98,64 +111,28 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 type AppendEntriesArgs struct {
-	term     int // leader term
-	leaderID int // leader id
+	Term     int // leader term
+	LeaderID int // leader id
 }
 
 type AppendEntriesReply struct {
-	term int // receiver term
+	Term int // receiver term
 }
 
 //
 // example RequestVote RPC arguments structure.
 //
 type RequestVoteArgs struct {
-	term        int // candidate term
-	candidateID int // candidate id
+	Term        int // candidate term
+	CandidateID int // candidate id
 }
 
 //
 // example RequestVote RPC reply structure.
 //
 type RequestVoteReply struct {
-	term        int  // receiver term
-	voteGranted bool // true if vote granted false otherwise
-}
-
-//
-// example RequestVote RPC handler.
-//
-func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
-}
-
-func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
-}
-
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// returns true if labrpc says the RPC was delivered.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
-
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
+	Term        int  // receiver term
+	VoteGranted bool // true if vote granted false otherwise
 }
 
 //
@@ -207,16 +184,17 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.me = me
 
 	// Your initialization code here.
-	rf.isLeader = false
+	rf.state = "follower"
 	rf.currentTerm = 0
 	rf.votedFor = 0
-
-	rf.begin = make(chan int)
+	rf.voteRequested = make(chan int)
+	rf.isLeader = make(chan int)
 	rf.heartBeat = make(chan int)
+	rf.closeHeartBeat = make(chan int)
 
 	// spawn necessary goroutines
-	go startElection(rf.begin)
-	go electionTimer(rf.heartBeat)
+	go nodeHandler(rf, me)
+	// go foo(ch)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -224,27 +202,207 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	return rf
 }
 
-func electionTimer(heartBeat chan int) {
+func nodeHandler(rf *Raft, me int) {
 	rand.Seed(time.Now().UnixNano())
-	min := 300
-	max := 600
+	min := 250
+	max := 450
+	loop := true
 
-	for {
+	for loop {
 		select {
 		case <-time.After(time.Duration(rand.Intn(max-min)+min) * time.Millisecond):
 			// milord is no more
-		case <-heartBeat:
+			go election(rf, rf.isLeader)
+
+		case <-rf.heartBeat:
 			// thou art alive milord, reset timer
 			continue
+		case <-rf.voteRequested:
+			// election progressing
+			continue
+		case <-rf.isLeader:
+			// exit if made leader
+			// loop = false
 		}
 	}
 }
 
-func startElection(begin chan int) {
-	for {
+func election(rf *Raft, isLeader chan int) {
+	fmt.Println(rf.me, "ELECTION")
+	rf.mu.Lock()
+	rf.currentTerm += 1
+	term := rf.currentTerm
+	rf.state = "candidate"
+	rf.voteCount += 1
+	totalPeers := len(rf.peers)
+	rf.mu.Unlock()
+
+	storeReplies := make(map[int]*RequestVoteReply)
+	Args := RequestVoteArgs{term, rf.me}
+
+	// request votes
+	for i := 0; i < totalPeers; i++ {
+		if i != rf.me {
+			storeReplies[i] = new(RequestVoteReply)
+			go rf.sendRequestVote(i, Args, storeReplies[i])
+		}
+	}
+
+	// wait for election to complete or timeout
+	loop := true
+	ch := make(chan bool)
+	go timer(ch)
+
+	for loop {
 		select {
-		case <-begin:
-			// who shall be our king
+		case loop = <-ch:
+			continue
+		default:
+			rf.mu.Lock()
+			status := rf.voteCount
+			rf.mu.Unlock()
+
+			if status > (totalPeers / 2) {
+				// become Leader
+				rf.mu.Lock()
+				rf.state = "leader"
+				rf.mu.Unlock()
+				isLeader <- 1
+				return
+			}
+		}
+	}
+}
+
+//
+// example RequestVote RPC handler. SV end
+//
+func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
+	rf.voteRequested <- -1
+	term := args.Term
+	candidateID := args.CandidateID
+
+	rf.mu.Lock()
+	currentTerm := rf.currentTerm
+	// votedFor := rf.votedFor
+	rf.mu.Unlock()
+
+	if currentTerm >= term {
+		reply.Term = currentTerm
+		reply.VoteGranted = false
+
+	} else {
+		reply.VoteGranted = true
+
+		rf.mu.Lock()
+		rf.currentTerm = term
+		rf.votedFor = candidateID
+		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	currentTerm := rf.currentTerm
+	rf.mu.Unlock()
+
+	if currentTerm > args.Term {
+		reply.Term = currentTerm
+
+	} else {
+		rf.mu.Lock()
+		rf.currentTerm = args.Term
+		rf.mu.Unlock()
+
+		rf.heartBeat <- 1
+	}
+}
+
+//
+// example code to send a RequestVote RPC to a server.
+// server is the index of the target server in rf.peers[].
+// expects RPC arguments in args.
+// fills in *reply with RPC reply, so caller should
+// pass &reply.
+// the types of the args and reply passed to Call() must be
+// the same as the types of the arguments declared in the
+// handler function (including whether they are pointers).
+//
+// returns true if labrpc says the RPC was delivered.
+//
+// if you're having trouble getting RPC to work, check that you've
+// capitalized all field names in structs passed over RPC, and
+// that the caller passes the address of the reply struct with &, not
+// the struct itself.
+//
+
+func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+
+	if ok {
+		rf.mu.Lock()
+		if reply.VoteGranted {
+			rf.voteCount += 1
+
+		} else {
+			rf.currentTerm = reply.Term
+		}
+		rf.mu.Unlock()
+	}
+
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
+	if ok {
+		rf.mu.Lock()
+		if rf.currentTerm < reply.Term {
+			rf.currentTerm = reply.Term
+			rf.state = "follower"
+		}
+		rf.mu.Unlock()
+	}
+
+	return ok
+}
+
+func timer(timeout chan bool) {
+	rand.Seed(time.Now().UnixNano())
+	min := 250
+	max := 450
+	dur := rand.Intn(max-min) + min
+
+	time.Sleep(time.Duration(dur) * time.Millisecond)
+
+	timeout <- false
+}
+
+func heartBeat(rf *Raft) {
+	loop := true
+
+	for loop {
+		select {
+		case <-rf.closeHeartBeat:
+			loop = false
+			continue
+		default:
+			rf.mu.Lock()
+			totalPeers := len(rf.peers)
+			term := rf.currentTerm
+			rf.mu.Unlock()
+
+			storeReplies := make(map[int]*AppendEntriesReply)
+			Args := AppendEntriesArgs{term, rf.me}
+
+			// send heartbeats
+			for i := 0; i < totalPeers; i++ {
+				if i != rf.me {
+					storeReplies[i] = new(AppendEntriesReply)
+					go rf.sendAppendEntries(i, Args, storeReplies[i])
+				}
+			}
 		}
 	}
 }
