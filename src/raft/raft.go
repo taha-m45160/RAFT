@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -46,10 +45,10 @@ type Raft struct {
 	votedFor    int    // candidate id of the server that this server voted for in current term
 	state       string // whether the node is a follower, candidate, or leader
 
-	voteCount     int
-	voteRequested chan int
-	heartBeat     chan int
-	legitimate    chan bool
+	voteCount     int       // count of total votes in each election for a node
+	voteRequested chan int  // channel to inform main process if requestVote RPC received
+	heartBeat     chan int  // channel to inform main process if heartbeat received
+	legitLeader   chan bool // channel to inform main process of a heartbeat from a legitimate leader
 }
 
 func (rf *Raft) GetState() (int, bool) {
@@ -100,7 +99,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.votedFor = -1
 	rf.voteRequested = make(chan int)
 	rf.heartBeat = make(chan int)
-	rf.legitimate = make(chan bool)
+	rf.legitLeader = make(chan bool)
 
 	// spawn necessary goroutines
 	go nodeMain(rf, me)
@@ -156,10 +155,10 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		rf.currentTerm = args.Term
 		rf.state = "follower"
 
-		// if candidate and heartbeat received from legitimate leader
+		// if candidate and heartbeat received from legitLeader leader
 		// then cancel election and revert to follower
 		if rf.state == "candidate" {
-			rf.legitimate <- false
+			rf.legitLeader <- false
 		}
 		rf.mu.Unlock()
 
@@ -267,7 +266,6 @@ func nodeMain(rf *Raft, me int) {
 
 		switch state {
 		case "follower":
-			fmt.Println("follower", rf.me)
 			select {
 			case <-time.After(time.Duration(rand.Intn(max-min)+min) * time.Millisecond):
 				// leader timed out
@@ -280,10 +278,8 @@ func nodeMain(rf *Raft, me int) {
 				// timeout reset
 			}
 		case "candidate":
-			fmt.Println("CANDIDATE", rf.me)
 			election(rf)
 		case "leader":
-			fmt.Println("LEADER", rf.me)
 			heartBeat(rf)
 			t := make(chan bool)
 			h := true
@@ -322,7 +318,7 @@ func election(rf *Raft) {
 		select {
 		case loop = <-ch:
 			continue
-		case loop = <-rf.legitimate:
+		case loop = <-rf.legitLeader:
 			continue
 		default:
 			rf.mu.Lock()
