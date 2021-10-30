@@ -207,6 +207,20 @@ func nodeHandler(rf *Raft, me int) {
 	max := 450
 	loop := true
 
+	// for {
+	// 	rf.mu.Lock()
+	// 	state := rf.state
+	// 	rf.mu.Unlock()
+
+	// 	switch state {
+	// 	case "follower":
+	// 		// follower
+	// 	case "candidate":
+	// 		// cand
+	// 	case "leader":
+
+	// }
+
 	for loop {
 		select {
 		case <-time.After(time.Duration(rand.Intn(max-min)+min) * time.Millisecond):
