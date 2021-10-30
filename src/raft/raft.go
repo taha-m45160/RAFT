@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -212,7 +211,7 @@ func nodeHandler(rf *Raft, me int) {
 		select {
 		case <-time.After(time.Duration(rand.Intn(max-min)+min) * time.Millisecond):
 			// milord is no more
-			go election(rf, rf.isLeader)
+			go election(rf)
 
 		case <-rf.heartBeat:
 			// thou art alive milord, reset timer
@@ -227,8 +226,7 @@ func nodeHandler(rf *Raft, me int) {
 	}
 }
 
-func election(rf *Raft, isLeader chan int) {
-	fmt.Println(rf.me, "ELECTION")
+func election(rf *Raft) {
 	rf.mu.Lock()
 	rf.currentTerm += 1
 	term := rf.currentTerm
@@ -266,8 +264,9 @@ func election(rf *Raft, isLeader chan int) {
 				// become Leader
 				rf.mu.Lock()
 				rf.state = "leader"
+				rf.isLeader <- 1
 				rf.mu.Unlock()
-				isLeader <- 1
+
 				return
 			}
 		}
@@ -279,15 +278,17 @@ func election(rf *Raft, isLeader chan int) {
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	rf.voteRequested <- -1
-	term := args.Term
-	candidateID := args.CandidateID
 
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	// votedFor := rf.votedFor
 	rf.mu.Unlock()
 
-	if currentTerm >= term {
+	// candidate requesting vote has a stale term
+	// or the same term in which case
+	// this node is the candidate itself or
+	// has already voted for another candidate
+	if currentTerm >= args.Term {
 		reply.Term = currentTerm
 		reply.VoteGranted = false
 
@@ -295,8 +296,8 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 
 		rf.mu.Lock()
-		rf.currentTerm = term
-		rf.votedFor = candidateID
+		rf.currentTerm = args.Term
+		rf.votedFor = args.CandidateID
 		rf.mu.Unlock()
 	}
 }
@@ -307,9 +308,11 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	rf.mu.Unlock()
 
 	if currentTerm > args.Term {
+		// received appendEntries from old leader
 		reply.Term = currentTerm
 
 	} else {
+		// heartBeat received
 		rf.mu.Lock()
 		rf.currentTerm = args.Term
 		rf.mu.Unlock()
@@ -339,12 +342,14 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 
+	// handle reply for the requested vote
 	if ok {
 		rf.mu.Lock()
 		if reply.VoteGranted {
 			rf.voteCount += 1
 
 		} else {
+			// consider converting candidate to follower
 			rf.currentTerm = reply.Term
 		}
 		rf.mu.Unlock()
@@ -356,8 +361,10 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 
+	// handle appendEntries reply from a node
 	if ok {
 		rf.mu.Lock()
+		// leader returns to follower state if its currentTerm is stale
 		if rf.currentTerm < reply.Term {
 			rf.currentTerm = reply.Term
 			rf.state = "follower"
@@ -368,6 +375,7 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 	return ok
 }
 
+/*sends false in the given channel when the timer runs out*/
 func timer(timeout chan bool) {
 	rand.Seed(time.Now().UnixNano())
 	min := 250
@@ -379,30 +387,22 @@ func timer(timeout chan bool) {
 	timeout <- false
 }
 
+/*sends empty AppendEntries RPC as heartbeat message*/
 func heartBeat(rf *Raft) {
-	loop := true
+	// get state
+	rf.mu.Lock()
+	totalPeers := len(rf.peers)
+	term := rf.currentTerm
+	rf.mu.Unlock()
 
-	for loop {
-		select {
-		case <-rf.closeHeartBeat:
-			loop = false
-			continue
-		default:
-			rf.mu.Lock()
-			totalPeers := len(rf.peers)
-			term := rf.currentTerm
-			rf.mu.Unlock()
+	storeReplies := make(map[int]*AppendEntriesReply)
+	Args := AppendEntriesArgs{term, rf.me}
 
-			storeReplies := make(map[int]*AppendEntriesReply)
-			Args := AppendEntriesArgs{term, rf.me}
-
-			// send heartbeats
-			for i := 0; i < totalPeers; i++ {
-				if i != rf.me {
-					storeReplies[i] = new(AppendEntriesReply)
-					go rf.sendAppendEntries(i, Args, storeReplies[i])
-				}
-			}
+	// send heartbeats
+	for i := 0; i < totalPeers; i++ {
+		if i != rf.me {
+			storeReplies[i] = new(AppendEntriesReply)
+			go rf.sendAppendEntries(i, Args, storeReplies[i])
 		}
 	}
 }
