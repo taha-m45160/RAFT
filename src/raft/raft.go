@@ -15,17 +15,24 @@ type ApplyMsg struct {
 }
 
 type AppendEntriesArgs struct {
-	Term     int // leader term
-	LeaderID int // leader id
+	Term         int            // leader term
+	LeaderID     int            // leader id
+	PrevLogIndex int            // index of log entry immediately preceding new ones
+	PrevLogTerm  int            // term of prevLogIndex entry
+	Entries      map[string]int // log entries to store (empty for heartbeat; consider sending more than one for efficiency)
+	LeaderCommit int            // leader's commit index (?)
 }
 
 type AppendEntriesReply struct {
-	Term int // receiver term
+	Term    int  // receiver term
+	Success bool // does follower contain entry matching prevLogIndex and prevLogTerm
 }
 
 type RequestVoteArgs struct {
-	Term        int // candidate term
-	CandidateID int // candidate id
+	Term         int // candidate term
+	CandidateID  int // candidate id
+	LastLogIndex int // index of candidate's last log entry
+	LastLogTerm  int // term of candidate's last log entry
 }
 
 type RequestVoteReply struct {
@@ -110,6 +117,52 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	return rf
 }
 
+/*request vote rpc sent and reply handled*/
+func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+
+	// handle reply for the requested vote
+	if ok {
+		rf.mu.Lock()
+		if reply.VoteGranted {
+			rf.voteCount += 1
+
+		} else {
+			// consider converting candidate to follower
+			if rf.currentTerm < reply.Term {
+				rf.state = "follower"
+			}
+			rf.currentTerm = reply.Term
+		}
+		rf.mu.Unlock()
+	}
+
+	return ok
+}
+
+/*append entries rpc sent and reply handled*/
+func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
+	// handle appendEntries reply from a node
+	if ok {
+		rf.mu.Lock()
+		// leader returns to follower state if its currentTerm is stale
+		if rf.currentTerm < reply.Term {
+			rf.currentTerm = reply.Term
+			rf.state = "follower"
+		}
+		rf.mu.Unlock()
+
+	} else {
+		rf.mu.Lock()
+		rf.state = "follower"
+		rf.mu.Unlock()
+	}
+
+	return ok
+}
+
 /*request vote rpc received and reply dispatched*/
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	rf.voteRequested <- -1
@@ -164,52 +217,6 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 		rf.heartBeat <- 1
 	}
-}
-
-/*request vote rpc sent and reply handled*/
-func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-
-	// handle reply for the requested vote
-	if ok {
-		rf.mu.Lock()
-		if reply.VoteGranted {
-			rf.voteCount += 1
-
-		} else {
-			// consider converting candidate to follower
-			if rf.currentTerm < reply.Term {
-				rf.state = "follower"
-			}
-			rf.currentTerm = reply.Term
-		}
-		rf.mu.Unlock()
-	}
-
-	return ok
-}
-
-/*append entries rpc sent and reply handled*/
-func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-
-	// handle appendEntries reply from a node
-	if ok {
-		rf.mu.Lock()
-		// leader returns to follower state if its currentTerm is stale
-		if rf.currentTerm < reply.Term {
-			rf.currentTerm = reply.Term
-			rf.state = "follower"
-		}
-		rf.mu.Unlock()
-
-	} else {
-		rf.mu.Lock()
-		rf.state = "follower"
-		rf.mu.Unlock()
-	}
-
-	return ok
 }
 
 /*return false when timer runs out*/
