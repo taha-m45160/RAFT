@@ -249,7 +249,8 @@ func heartBeat(rf *Raft) {
 	rf.mu.Unlock()
 
 	storeReplies := make(map[int]*AppendEntriesReply)
-	Args := AppendEntriesArgs{term, rf.me}
+	emptyMap := make(map[string]int)
+	Args := AppendEntriesArgs{term, rf.me, -1, -1, emptyMap, -1}
 
 	// send heartbeats
 	for i := 0; i < totalPeers; i++ {
@@ -305,7 +306,7 @@ func election(rf *Raft) {
 	rf.mu.Unlock()
 
 	storeReplies := make(map[int]*RequestVoteReply)
-	Args := RequestVoteArgs{term, rf.me}
+	Args := RequestVoteArgs{term, rf.me, -1, -1}
 
 	// request votes
 	for i := 0; i < totalPeers; i++ {
