@@ -76,11 +76,6 @@ type Raft struct {
 	state       string     // whether the node is a follower, candidate, or leader
 	log         []LogEntry // stores log entries
 
-	voteCount     int       // count of total votes in each election for a node
-	voteRequested chan int  // channel to inform main process if requestVote RPC received
-	heartBeat     chan int  // channel to inform main process if heartbeat received
-	legitLeader   chan bool // channel to inform main process of a heartbeat from a legitimate leader
-
 	// volatile state
 	commitIndex int // highest log entry known to be committed
 	lastApplied int // highest log entry applied to state machine
@@ -88,6 +83,15 @@ type Raft struct {
 	// volatile state if leader
 	nextIndex  map[int]int // index of the next entry to send to each server
 	matchIndex map[int]int // index of highest log entry to send to each server
+
+	// utility
+	voteCount     int       // count of total votes in each election for a node
+	voteRequested chan int  // channel to inform main process if requestVote RPC received
+	heartBeat     chan int  // channel to inform main process if heartbeat received
+	legitLeader   chan bool // channel to inform main process of a heartbeat from a legitimate leader
+
+	prevLogTerm  int
+	prevLogIndex int
 }
 
 func (rf *Raft) GetState() (int, bool) {
@@ -150,6 +154,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.state = "follower"
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.prevLogIndex = -1
+	rf.prevLogTerm = rf.currentTerm
 	rf.voteRequested = make(chan int)
 	rf.heartBeat = make(chan int)
 	rf.legitLeader = make(chan bool)
@@ -292,10 +298,13 @@ func heartBeat(rf *Raft) {
 	rf.mu.Lock()
 	totalPeers := len(rf.peers)
 	term := rf.currentTerm
+	log := rf.log
 	rf.mu.Unlock()
 
 	storeReplies := make(map[int]*AppendEntriesReply)
-	Args := AppendEntriesArgs{term, rf.me, -1, -1, []LogEntry{}, -1}
+	rf.mu.Lock()
+	Args := AppendEntriesArgs{term, rf.me, rf.prevLogIndex, rf.prevLogTerm, log, rf.commitIndex}
+	rf.mu.Unlock()
 
 	// send heartbeats
 	for i := 0; i < totalPeers; i++ {
@@ -304,6 +313,11 @@ func heartBeat(rf *Raft) {
 			go rf.sendAppendEntries(i, Args, storeReplies[i])
 		}
 	}
+
+	rf.mu.Lock()
+	rf.prevLogIndex = len(log) - 1
+	rf.prevLogTerm = term
+	rf.mu.Unlock()
 }
 
 /*main RAFT peer process*/
