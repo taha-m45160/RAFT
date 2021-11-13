@@ -85,10 +85,11 @@ type Raft struct {
 	matchIndex map[int]int // index of highest log entry to send to each server
 
 	// utility
-	voteCount     int       // count of total votes in each election for a node
-	voteRequested chan int  // channel to inform main process if requestVote RPC received
-	heartBeat     chan int  // channel to inform main process if heartbeat received
-	legitLeader   chan bool // channel to inform main process of a heartbeat from a legitimate leader
+	voteCount     int          // count of total votes in each election for a node
+	voteRequested chan int     // channel to inform main process if requestVote RPC received
+	heartBeat     chan int     // channel to inform main process if heartbeat received
+	legitLeader   chan bool    // channel to inform main process of a heartbeat from a legitimate leader
+	requestQueue  chan Request // queue for client requests
 
 	prevLogTerm  int
 	prevLogIndex int
@@ -130,9 +131,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// add entry to log
 		rf.mu.Lock()
 		term := rf.currentTerm
-		index := len(rf.log) + 1
-		rf.log = append(rf.log, LogEntry{c, rf.currentTerm})
+		index := len(rf.log)
+		entry := LogEntry{c, term}
+		rf.log = append(rf.log, entry)
 		rf.mu.Unlock()
+
+		rf.requestQueue <- Request{c, index}
 
 		return index, term, true
 
@@ -142,6 +146,52 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) Kill() {
+}
+
+type Request struct {
+	command interface{}
+	index   int
+}
+
+func handleCommits(rf *Raft, applyCh chan ApplyMsg) {
+	for {
+		newReq := <-rf.requestQueue
+
+		rf.mu.Lock()
+		term := rf.currentTerm
+		log := rf.log
+		totalPeers := len(rf.peers)
+
+		Args := AppendEntriesArgs{term, rf.me, rf.prevLogIndex, rf.prevLogTerm, log, rf.commitIndex}
+		rf.mu.Unlock()
+
+		storeReplies := make([]*AppendEntriesReply, totalPeers)
+		successCount := 0
+
+		// send append entries
+		for i := 0; i < totalPeers; i++ {
+			if i != rf.me {
+				storeReplies[i] = new(AppendEntriesReply)
+				rf.sendAppendEntries(i, Args, storeReplies[i]) // blocks
+
+				if storeReplies[i].Success {
+					successCount++
+				}
+			}
+		}
+
+		if successCount > (totalPeers / 2) {
+			// commit entry
+			e := make([]byte, 0)
+			fmt.Println("sent")
+			applyCh <- ApplyMsg{newReq.index, newReq.command, true, e}
+		}
+
+		rf.mu.Lock()
+		rf.prevLogIndex = len(log) - 1
+		rf.prevLogTerm = term
+		rf.mu.Unlock()
+	}
 }
 
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
@@ -159,9 +209,11 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.voteRequested = make(chan int)
 	rf.heartBeat = make(chan int)
 	rf.legitLeader = make(chan bool)
+	rf.requestQueue = make(chan Request, 500)
 
 	// spawn necessary goroutines
 	go nodeMain(rf, me)
+	go handleCommits(rf, applyCh)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -219,9 +271,19 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		if rf.state == "candidate" {
 			rf.legitLeader <- false
 		}
+
 		rf.mu.Unlock()
 
 		rf.heartBeat <- 1
+
+		// append new entries
+		rf.mu.Lock()
+		for i := args.PrevLogIndex + 1; i < len(args.Entries); i++ {
+			rf.log = append(rf.log, args.Entries[i])
+		}
+		rf.mu.Unlock()
+
+		reply.Success = true
 	}
 }
 
@@ -303,7 +365,7 @@ func heartBeat(rf *Raft) {
 
 	storeReplies := make(map[int]*AppendEntriesReply)
 	rf.mu.Lock()
-	Args := AppendEntriesArgs{term, rf.me, rf.prevLogIndex, rf.prevLogTerm, log, rf.commitIndex}
+	Args := AppendEntriesArgs{term, rf.me, -1, -1, []LogEntry{}, -1}
 	rf.mu.Unlock()
 
 	// send heartbeats
