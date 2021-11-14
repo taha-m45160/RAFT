@@ -182,9 +182,7 @@ func handleCommits(rf *Raft, applyCh chan ApplyMsg) {
 
 		if successCount > (totalPeers / 2) {
 			// commit entry
-			e := make([]byte, 0)
-			fmt.Println("sent")
-			applyCh <- ApplyMsg{newReq.index, newReq.command, true, e}
+			applyCh <- ApplyMsg{newReq.index, newReq.command, false, make([]byte, 0)}
 		}
 
 		rf.mu.Lock()
@@ -210,6 +208,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.heartBeat = make(chan int)
 	rf.legitLeader = make(chan bool)
 	rf.requestQueue = make(chan Request, 500)
+	rf.lastApplied = -1
+	rf.commitIndex = -1
 
 	// spawn necessary goroutines
 	go nodeMain(rf, me)
@@ -280,6 +280,11 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		rf.mu.Lock()
 		for i := args.PrevLogIndex + 1; i < len(args.Entries); i++ {
 			rf.log = append(rf.log, args.Entries[i])
+		}
+
+		// if any new entries have been committed by the leader
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 		}
 		rf.mu.Unlock()
 
@@ -470,4 +475,12 @@ func election(rf *Raft) {
 	rf.mu.Lock()
 	rf.voteCount = 0
 	rf.mu.Unlock()
+}
+
+/*utility function*/
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
