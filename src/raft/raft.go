@@ -85,11 +85,12 @@ type Raft struct {
 	matchIndex map[int]int // index of highest log entry to send to each server
 
 	// utility
-	voteCount     int          // count of total votes in each election for a node
-	voteRequested chan int     // channel to inform main process if requestVote RPC received
-	heartBeat     chan int     // channel to inform main process if heartbeat received
-	legitLeader   chan bool    // channel to inform main process of a heartbeat from a legitimate leader
-	requestQueue  chan Request // queue for client requests
+	voteCount      int           // count of total votes in each election for a node
+	voteRequested  chan int      // channel to inform main process if requestVote RPC received
+	heartBeat      chan int      // channel to inform main process if heartbeat received
+	legitLeader    chan bool     // channel to inform main process of a heartbeat from a legitimate leader
+	requestQueue   chan Request  // queue for client requests
+	followerCommit chan ApplyMsg // forwards commit requests for follower
 
 	prevLogTerm  int
 	prevLogIndex int
@@ -155,40 +156,48 @@ type Request struct {
 
 func handleCommits(rf *Raft, applyCh chan ApplyMsg) {
 	for {
-		newReq := <-rf.requestQueue
+		select {
+		case newReq := <-rf.requestQueue:
+			// leader commit processing
+			rf.mu.Lock()
+			term := rf.currentTerm
+			log := rf.log
+			totalPeers := len(rf.peers)
 
-		rf.mu.Lock()
-		term := rf.currentTerm
-		log := rf.log
-		totalPeers := len(rf.peers)
+			fmt.Println(rf.lastApplied)
+			Args := AppendEntriesArgs{term, rf.me, rf.prevLogIndex, rf.prevLogTerm, log, rf.lastApplied}
+			rf.mu.Unlock()
 
-		Args := AppendEntriesArgs{term, rf.me, rf.prevLogIndex, rf.prevLogTerm, log, rf.commitIndex}
-		rf.mu.Unlock()
+			storeReplies := make([]*AppendEntriesReply, totalPeers)
+			successCount := 0
 
-		storeReplies := make([]*AppendEntriesReply, totalPeers)
-		successCount := 0
+			// send append entries
+			for i := 0; i < totalPeers; i++ {
+				if i != rf.me {
+					storeReplies[i] = new(AppendEntriesReply)
+					rf.sendAppendEntries(i, Args, storeReplies[i]) // blocks
 
-		// send append entries
-		for i := 0; i < totalPeers; i++ {
-			if i != rf.me {
-				storeReplies[i] = new(AppendEntriesReply)
-				rf.sendAppendEntries(i, Args, storeReplies[i]) // blocks
-
-				if storeReplies[i].Success {
-					successCount++
+					if storeReplies[i].Success {
+						successCount++
+					}
 				}
 			}
-		}
 
-		if successCount > (totalPeers / 2) {
-			// commit entry
-			applyCh <- ApplyMsg{newReq.index, newReq.command, false, make([]byte, 0)}
-		}
+			if successCount > (totalPeers / 2) {
+				// commit entry
+				applyCh <- ApplyMsg{newReq.index, newReq.command, false, make([]byte, 0)}
+			}
 
-		rf.mu.Lock()
-		rf.prevLogIndex = len(log) - 1
-		rf.prevLogTerm = term
-		rf.mu.Unlock()
+			rf.mu.Lock()
+			rf.lastApplied++
+			rf.prevLogIndex = len(log) - 1
+			rf.prevLogTerm = term
+			rf.mu.Unlock()
+
+		case newCommit := <-rf.followerCommit:
+			// follower commit processing
+			applyCh <- newCommit
+		}
 	}
 }
 
@@ -208,6 +217,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.heartBeat = make(chan int)
 	rf.legitLeader = make(chan bool)
 	rf.requestQueue = make(chan Request, 500)
+	rf.followerCommit = make(chan ApplyMsg)
 	rf.lastApplied = -1
 	rf.commitIndex = -1
 
@@ -285,6 +295,12 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		// if any new entries have been committed by the leader
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		}
+
+		//fmt.Println(rf.me, rf.commitIndex, rf.lastApplied)
+		if rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			rf.followerCommit <- ApplyMsg{rf.lastApplied, rf.log[rf.lastApplied].Command, false, make([]byte, 0)}
 		}
 		rf.mu.Unlock()
 
@@ -370,7 +386,7 @@ func heartBeat(rf *Raft) {
 
 	storeReplies := make(map[int]*AppendEntriesReply)
 	rf.mu.Lock()
-	Args := AppendEntriesArgs{term, rf.me, -1, -1, []LogEntry{}, -1}
+	Args := AppendEntriesArgs{term, rf.me, rf.prevLogIndex, rf.prevLogTerm, []LogEntry{}, rf.lastApplied}
 	rf.mu.Unlock()
 
 	// send heartbeats
