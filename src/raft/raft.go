@@ -124,6 +124,8 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	c := command
 
+	fmt.Println("start1.0")
+
 	rf.mu.Lock()
 	s := rf.state
 	rf.mu.Unlock()
@@ -164,7 +166,6 @@ func handleCommits(rf *Raft, applyCh chan ApplyMsg) {
 			log := rf.log
 			totalPeers := len(rf.peers)
 
-			fmt.Println(rf.lastApplied)
 			Args := AppendEntriesArgs{term, rf.me, rf.prevLogIndex, rf.prevLogTerm, log, rf.lastApplied}
 			rf.mu.Unlock()
 
@@ -183,6 +184,7 @@ func handleCommits(rf *Raft, applyCh chan ApplyMsg) {
 				}
 			}
 
+			// what if entry is not committed?
 			if successCount > (totalPeers / 2) {
 				// commit entry
 				applyCh <- ApplyMsg{newReq.index, newReq.command, false, make([]byte, 0)}
@@ -190,7 +192,7 @@ func handleCommits(rf *Raft, applyCh chan ApplyMsg) {
 
 			rf.mu.Lock()
 			rf.lastApplied++
-			rf.prevLogIndex = len(log) - 1
+			rf.prevLogIndex = newReq.index
 			rf.prevLogTerm = term
 			rf.mu.Unlock()
 
@@ -211,15 +213,16 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.state = "follower"
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.prevLogIndex = -1
-	rf.prevLogTerm = rf.currentTerm
+	rf.prevLogIndex = 0
+	rf.prevLogTerm = 0
 	rf.voteRequested = make(chan int)
 	rf.heartBeat = make(chan int)
 	rf.legitLeader = make(chan bool)
 	rf.requestQueue = make(chan Request, 500)
 	rf.followerCommit = make(chan ApplyMsg)
-	rf.lastApplied = -1
-	rf.commitIndex = -1
+	rf.lastApplied = 0
+	rf.commitIndex = 0
+	rf.log = make([]LogEntry, 1)
 
 	// spawn necessary goroutines
 	go nodeMain(rf, me)
@@ -289,15 +292,16 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		// append new entries
 		rf.mu.Lock()
 		for i := args.PrevLogIndex + 1; i < len(args.Entries); i++ {
-			rf.log = append(rf.log, args.Entries[i])
+			if i >= 0 {
+				rf.log = append(rf.log, args.Entries[i])
+			}
 		}
 
 		// if any new entries have been committed by the leader
 		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+			rf.commitIndex = min(args.LeaderCommit, len(rf.log))
 		}
 
-		//fmt.Println(rf.me, rf.commitIndex, rf.lastApplied)
 		if rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
 			rf.followerCommit <- ApplyMsg{rf.lastApplied, rf.log[rf.lastApplied].Command, false, make([]byte, 0)}
@@ -440,7 +444,7 @@ func nodeMain(rf *Raft, me int) {
 
 /*election process conducted upon leader failure*/
 func election(rf *Raft) {
-	fmt.Println("ELECTION YAY")
+	// fmt.Println("ELECTION YAY")
 	rf.mu.Lock()
 	rf.currentTerm += 1
 	term := rf.currentTerm
