@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -123,8 +122,6 @@ func (rf *Raft) readPersist(data []byte) {
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	c := command
-
-	fmt.Println("start1.0")
 
 	rf.mu.Lock()
 	s := rf.state
@@ -234,13 +231,40 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	return rf
 }
 
+func validateVote(lastLogIndex1, lastLogIndex2, lastLogTerm1, lastLogTerm2 int) bool {
+	/*
+		returns true if candidate's log is at least
+		as up-to-date as the follower's log
+		otherwise returns false
+
+		Input:
+		1: Candidate
+		2: Follower
+	*/
+
+	if lastLogTerm1 > lastLogTerm2 {
+		return true
+
+	} else if lastLogTerm1 < lastLogTerm2 {
+		return false
+
+	} else if lastLogIndex1 >= lastLogIndex2 {
+		return true
+
+	} else {
+		return false
+	}
+}
+
 /*request vote rpc received and reply dispatched*/
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	rf.voteRequested <- -1
 
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
-	// votedFor := rf.votedFor
+	votedFor := rf.votedFor
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].Term
 	rf.mu.Unlock()
 
 	// candidate requesting vote has a stale term
@@ -252,13 +276,19 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 
 	} else {
-		reply.VoteGranted = true
+		reply.VoteGranted = false
 
 		rf.mu.Lock()
 		rf.currentTerm = args.Term
 		rf.state = "follower"
 		rf.votedFor = args.CandidateID
 		rf.mu.Unlock()
+
+		// check if log atleast up-to-date as its own
+		validate := validateVote(args.LastLogIndex, lastLogIndex, args.LastLogTerm, lastLogTerm)
+		if (votedFor == -1 || votedFor == args.CandidateID) && validate {
+			reply.VoteGranted = true
+		}
 	}
 }
 
@@ -299,11 +329,12 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 		// if any new entries have been committed by the leader
 		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = min(args.LeaderCommit, len(rf.log))
+			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 		}
 
 		if rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
+
 			rf.followerCommit <- ApplyMsg{rf.lastApplied, rf.log[rf.lastApplied].Command, false, make([]byte, 0)}
 		}
 		rf.mu.Unlock()
@@ -412,24 +443,38 @@ func nodeMain(rf *Raft, me int) {
 	rand.Seed(time.Now().UnixNano())
 	min := 450
 	max := 600
+	prevState := "follower"
+	heartbeatCount := 0
 
 	for {
 		rf.mu.Lock()
 		state := rf.state
 		rf.mu.Unlock()
 
+		// reset vote
+		if (prevState == "candidate" && state == "follower") || heartbeatCount == 0 {
+			rf.mu.Lock()
+			rf.votedFor = -1
+			rf.mu.Unlock()
+		}
+
+		prevState = state
+
 		switch state {
 		case "follower":
 			select {
 			case <-time.After(time.Duration(rand.Intn(max-min)+min) * time.Millisecond):
 				// leader timed out
+				heartbeatCount = 0
 				rf.mu.Lock()
 				rf.state = "candidate"
 				rf.mu.Unlock()
 			case <-rf.heartBeat:
 				// timeout reset
+				heartbeatCount++
 			case <-rf.voteRequested:
 				// timeout reset
+				heartbeatCount = 0
 			}
 		case "candidate":
 			election(rf)
@@ -444,16 +489,18 @@ func nodeMain(rf *Raft, me int) {
 
 /*election process conducted upon leader failure*/
 func election(rf *Raft) {
-	// fmt.Println("ELECTION YAY")
+	//fmt.Println("ELECTION YAY", rf.me)
 	rf.mu.Lock()
 	rf.currentTerm += 1
 	term := rf.currentTerm
 	rf.voteCount += 1
 	totalPeers := len(rf.peers)
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].Term
 	rf.mu.Unlock()
 
 	storeReplies := make(map[int]*RequestVoteReply)
-	Args := RequestVoteArgs{term, rf.me, -1, -1}
+	Args := RequestVoteArgs{term, rf.me, lastLogIndex, lastLogTerm}
 
 	// request votes
 	for i := 0; i < totalPeers; i++ {
@@ -484,6 +531,7 @@ func election(rf *Raft) {
 				// become Leader
 				rf.mu.Lock()
 				rf.state = "leader"
+				rf.votedFor = -1
 				rf.mu.Unlock()
 
 				loop = false
