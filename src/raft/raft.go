@@ -24,6 +24,11 @@ import (
 	"time"
 )
 
+type Request struct {
+	command interface{}
+	index   int
+}
+
 type ApplyMsg struct {
 	Index       int
 	Command     interface{}
@@ -95,6 +100,54 @@ type Raft struct {
 	prevLogIndex int
 }
 
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
+	rf := &Raft{}
+	rf.peers = peers
+	rf.persister = persister
+	rf.me = me
+
+	// Your initialization code here.
+	rf.state = "follower"
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.prevLogIndex = 0
+	rf.prevLogTerm = 0
+	rf.voteRequested = make(chan int)
+	rf.heartBeat = make(chan int)
+	rf.legitLeader = make(chan bool)
+	rf.requestQueue = make(chan Request, 500)
+	rf.followerCommit = make(chan ApplyMsg)
+	rf.lastApplied = 0
+	rf.commitIndex = 0
+	rf.log = make([]LogEntry, 1)
+	rf.log[0].Term = 0 // garbage value at index 0
+	rf.nextIndex = make(map[int]int)
+	rf.matchIndex = make(map[int]int)
+
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.nextIndex[i] = 1
+	}
+
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.matchIndex[i] = 0
+	}
+
+	// spawn necessary goroutines
+	go nodeMain(rf, me)
+	go handleCommits(rf, applyCh)
+
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
+	return rf
+}
+
 func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
@@ -132,8 +185,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.mu.Lock()
 		term := rf.currentTerm
 		index := len(rf.log)
-		entry := LogEntry{c, term}
-		rf.log = append(rf.log, entry)
 		rf.mu.Unlock()
 
 		rf.requestQueue <- Request{c, index}
@@ -148,11 +199,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 }
 
-type Request struct {
-	command interface{}
-	index   int
-}
-
 func handleCommits(rf *Raft, applyCh chan ApplyMsg) {
 	for {
 		select {
@@ -160,6 +206,8 @@ func handleCommits(rf *Raft, applyCh chan ApplyMsg) {
 			// leader commit processing
 			rf.mu.Lock()
 			term := rf.currentTerm
+			entry := LogEntry{newReq.command, term}
+			rf.log = append(rf.log, entry)
 			log := rf.log
 			totalPeers := len(rf.peers)
 
@@ -183,7 +231,7 @@ func handleCommits(rf *Raft, applyCh chan ApplyMsg) {
 
 			// what if entry is not committed?
 			if successCount > (totalPeers / 2) {
-				// commit entry
+				// apply entry
 				applyCh <- ApplyMsg{newReq.index, newReq.command, false, make([]byte, 0)}
 			}
 
@@ -198,37 +246,6 @@ func handleCommits(rf *Raft, applyCh chan ApplyMsg) {
 			applyCh <- newCommit
 		}
 	}
-}
-
-func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-
-	// Your initialization code here.
-	rf.state = "follower"
-	rf.currentTerm = 0
-	rf.votedFor = -1
-	rf.prevLogIndex = 0
-	rf.prevLogTerm = 0
-	rf.voteRequested = make(chan int)
-	rf.heartBeat = make(chan int)
-	rf.legitLeader = make(chan bool)
-	rf.requestQueue = make(chan Request, 500)
-	rf.followerCommit = make(chan ApplyMsg)
-	rf.lastApplied = 0
-	rf.commitIndex = 0
-	rf.log = make([]LogEntry, 1)
-
-	// spawn necessary goroutines
-	go nodeMain(rf, me)
-	go handleCommits(rf, applyCh)
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
-	return rf
 }
 
 func validateVote(lastLogIndex1, lastLogIndex2, lastLogTerm1, lastLogTerm2 int) bool {
@@ -258,8 +275,6 @@ func validateVote(lastLogIndex1, lastLogIndex2, lastLogTerm1, lastLogTerm2 int) 
 
 /*request vote rpc received and reply dispatched*/
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
-	rf.voteRequested <- -1
-
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	votedFor := rf.votedFor
@@ -287,6 +302,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		// check if log atleast up-to-date as its own
 		validate := validateVote(args.LastLogIndex, lastLogIndex, args.LastLogTerm, lastLogTerm)
 		if (votedFor == -1 || votedFor == args.CandidateID) && validate {
+			rf.voteRequested <- -1
 			reply.VoteGranted = true
 		}
 	}
@@ -317,6 +333,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 		rf.mu.Unlock()
 
+		// reset timer
 		rf.heartBeat <- 1
 
 		// append new entries
@@ -458,8 +475,6 @@ func nodeMain(rf *Raft, me int) {
 			rf.mu.Unlock()
 		}
 
-		prevState = state
-
 		switch state {
 		case "follower":
 			select {
@@ -530,6 +545,23 @@ func election(rf *Raft) {
 			if status > (totalPeers / 2) {
 				// become Leader
 				rf.mu.Lock()
+				drainQueue(rf.requestQueue)
+
+				// reinitialize after election
+				for i := 0; i < len(rf.peers); i++ {
+					if i == rf.me {
+						continue
+					}
+					rf.nextIndex[i] = 1
+				}
+
+				for i := 0; i < len(rf.peers); i++ {
+					if i == rf.me {
+						continue
+					}
+					rf.matchIndex[i] = 0
+				}
+
 				rf.state = "leader"
 				rf.votedFor = -1
 				rf.mu.Unlock()
@@ -545,10 +577,17 @@ func election(rf *Raft) {
 	rf.mu.Unlock()
 }
 
-/*utility function*/
+/*utility functions*/
 func min(a, b int) int {
 	if a < b {
 		return a
 	}
 	return b
+}
+
+func drainQueue(ch chan Request) {
+	/*drains client request queue channel*/
+	for len(ch) > 0 {
+		<-ch
+	}
 }
