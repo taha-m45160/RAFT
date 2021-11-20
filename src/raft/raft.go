@@ -86,7 +86,7 @@ type Raft struct {
 
 	// volatile state if leader
 	nextIndex  map[int]int // index of the next entry to send to each server
-	matchIndex map[int]int // index of highest log entry to send to each server
+	matchIndex map[int]int // index of highest log entry known to be replicated on each server
 
 	// utility
 	voteCount      int           // count of total votes in each election for a node
@@ -95,9 +95,6 @@ type Raft struct {
 	legitLeader    chan bool     // channel to inform main process of a heartbeat from a legitimate leader
 	requestQueue   chan Request  // queue for client requests
 	followerCommit chan ApplyMsg // forwards commit requests for follower
-
-	prevLogTerm  int
-	prevLogIndex int
 }
 
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
@@ -110,8 +107,6 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.state = "follower"
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.prevLogIndex = 0
-	rf.prevLogTerm = 0
 	rf.voteRequested = make(chan int)
 	rf.heartBeat = make(chan int)
 	rf.legitLeader = make(chan bool)
@@ -139,8 +134,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	}
 
 	// spawn necessary goroutines
-	go nodeMain(rf, me)
-	go handleCommits(rf, applyCh)
+	go handleElection(rf, me)
+	go requestHandler(rf, applyCh)
+	go applyHandler(rf, applyCh)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -199,51 +195,75 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 }
 
-func handleCommits(rf *Raft, applyCh chan ApplyMsg) {
+/*periodically checks if a value is committed and in which case dispatches it to applyChannel*/
+func applyHandler(rf *Raft, applyCh chan ApplyMsg) {
 	for {
-		select {
-		case newReq := <-rf.requestQueue:
-			// leader commit processing
-			rf.mu.Lock()
-			term := rf.currentTerm
-			entry := LogEntry{newReq.command, term}
-			rf.log = append(rf.log, entry)
-			log := rf.log
-			totalPeers := len(rf.peers)
+		rf.mu.Lock()
+		commitIdx := rf.commitIndex
+		lastAppl := rf.lastApplied
+		log := rf.log
+		rf.mu.Unlock()
 
-			Args := AppendEntriesArgs{term, rf.me, rf.prevLogIndex, rf.prevLogTerm, log, rf.lastApplied}
-			rf.mu.Unlock()
-
-			storeReplies := make([]*AppendEntriesReply, totalPeers)
-			successCount := 0
-
-			// send append entries
-			for i := 0; i < totalPeers; i++ {
-				if i != rf.me {
-					storeReplies[i] = new(AppendEntriesReply)
-					rf.sendAppendEntries(i, Args, storeReplies[i]) // blocks
-
-					if storeReplies[i].Success {
-						successCount++
-					}
-				}
-			}
-
-			// what if entry is not committed?
-			if successCount > (totalPeers / 2) {
-				// apply entry
-				applyCh <- ApplyMsg{newReq.index, newReq.command, false, make([]byte, 0)}
-			}
-
+		// apply log entry if it has been committed
+		if commitIdx > lastAppl {
 			rf.mu.Lock()
 			rf.lastApplied++
-			rf.prevLogIndex = newReq.index
-			rf.prevLogTerm = term
+			lastAppl = rf.lastApplied
 			rf.mu.Unlock()
 
-		case newCommit := <-rf.followerCommit:
-			// follower commit processing
-			applyCh <- newCommit
+			applyCh <- ApplyMsg{lastAppl, log[lastAppl].Command, false, make([]byte, 0)}
+		}
+	}
+}
+
+/*handles client request (agreement on new log entry)*/
+func requestHandler(rf *Raft, applyCh chan ApplyMsg) {
+	for {
+		newReq := <-rf.requestQueue
+
+		// retrieve required state
+		rf.mu.Lock()
+		term := rf.currentTerm
+		entry := LogEntry{newReq.command, term}
+		rf.log = append(rf.log, entry)
+		log := rf.log
+		totalPeers := len(rf.peers)
+		rf.mu.Unlock()
+
+		// replicate new entry
+		storeReplies := make([]*AppendEntriesReply, totalPeers)
+		successCount := 0
+
+		// send append entries
+		for i := 0; i < totalPeers; i++ {
+			rf.mu.Lock()
+			nextIndex := rf.nextIndex[i]
+			rf.mu.Unlock()
+
+			if (i != rf.me) && (len(log)-1 >= nextIndex) {
+				storeReplies[i] = new(AppendEntriesReply)
+
+				prevLogIndex := nextIndex - 1
+				Args := AppendEntriesArgs{term, rf.me, prevLogIndex, log[prevLogIndex].Term, log, rf.lastApplied}
+				rf.sendAppendEntries(i, Args, storeReplies[i]) // blocks
+
+				if storeReplies[i].Success {
+					rf.mu.Lock()
+					rf.matchIndex[i] += 1
+					rf.nextIndex[i] = rf.matchIndex[i] + 1
+					rf.mu.Unlock()
+
+					successCount++
+				}
+			}
+		}
+
+		// ignore if entry not committed
+		if successCount > (totalPeers / 2) {
+			// commit entry
+			rf.mu.Lock()
+			rf.commitIndex = newReq.index
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -318,6 +338,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		// received appendEntries from old leader
 		// return newer term
 		reply.Term = currentTerm
+		reply.Success = false
 
 	} else {
 		// heartBeat received
@@ -349,11 +370,6 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 		}
 
-		if rf.commitIndex > rf.lastApplied {
-			rf.lastApplied++
-
-			rf.followerCommit <- ApplyMsg{rf.lastApplied, rf.log[rf.lastApplied].Command, false, make([]byte, 0)}
-		}
 		rf.mu.Unlock()
 
 		reply.Success = true
@@ -437,26 +453,23 @@ func heartBeat(rf *Raft) {
 	rf.mu.Unlock()
 
 	storeReplies := make(map[int]*AppendEntriesReply)
-	rf.mu.Lock()
-	Args := AppendEntriesArgs{term, rf.me, rf.prevLogIndex, rf.prevLogTerm, []LogEntry{}, rf.lastApplied}
-	rf.mu.Unlock()
 
 	// send heartbeats
 	for i := 0; i < totalPeers; i++ {
 		if i != rf.me {
+			rf.mu.Lock()
+			prevLogIndex := rf.nextIndex[i] - 1
+			Args := AppendEntriesArgs{term, rf.me, prevLogIndex, log[prevLogIndex].Term, []LogEntry{}, rf.lastApplied}
+			rf.mu.Unlock()
+
 			storeReplies[i] = new(AppendEntriesReply)
 			go rf.sendAppendEntries(i, Args, storeReplies[i])
 		}
 	}
-
-	rf.mu.Lock()
-	rf.prevLogIndex = len(log) - 1
-	rf.prevLogTerm = term
-	rf.mu.Unlock()
 }
 
-/*main RAFT peer process*/
-func nodeMain(rf *Raft, me int) {
+/*monitors node state and calls election on detecting leader failure*/
+func handleElection(rf *Raft, me int) {
 	rand.Seed(time.Now().UnixNano())
 	min := 450
 	max := 600
@@ -504,7 +517,6 @@ func nodeMain(rf *Raft, me int) {
 
 /*election process conducted upon leader failure*/
 func election(rf *Raft) {
-	//fmt.Println("ELECTION YAY", rf.me)
 	rf.mu.Lock()
 	rf.currentTerm += 1
 	term := rf.currentTerm
