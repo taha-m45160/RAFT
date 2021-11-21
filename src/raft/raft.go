@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -206,12 +207,14 @@ func applyHandler(rf *Raft, applyCh chan ApplyMsg) {
 
 		// apply log entry if it has been committed
 		if commitIdx > lastAppl {
-			rf.mu.Lock()
-			rf.lastApplied++
-			lastAppl = rf.lastApplied
-			rf.mu.Unlock()
+			for lastAppl <= commitIdx {
+				rf.mu.Lock()
+				rf.lastApplied++
+				lastAppl = rf.lastApplied
+				rf.mu.Unlock()
 
-			applyCh <- ApplyMsg{lastAppl, log[lastAppl].Command, false, make([]byte, 0)}
+				applyCh <- ApplyMsg{lastAppl, log[lastAppl].Command, false, make([]byte, 0)}
+			}
 		}
 	}
 }
@@ -244,7 +247,7 @@ func requestHandler(rf *Raft, applyCh chan ApplyMsg) {
 				storeReplies[i] = new(AppendEntriesReply)
 
 				prevLogIndex := nextIndex - 1
-				Args := AppendEntriesArgs{term, rf.me, prevLogIndex, log[prevLogIndex].Term, log, rf.lastApplied}
+				Args := AppendEntriesArgs{term, rf.me, prevLogIndex, log[prevLogIndex].Term, log, rf.commitIndex}
 				rf.sendAppendEntries(i, Args, storeReplies[i]) // blocks
 
 				if storeReplies[i].Success {
@@ -259,13 +262,41 @@ func requestHandler(rf *Raft, applyCh chan ApplyMsg) {
 		}
 
 		// ignore if entry not committed
-		if successCount > (totalPeers / 2) {
+		if commitEntry(rf, newReq.index) {
 			// commit entry
 			rf.mu.Lock()
 			rf.commitIndex = newReq.index
 			rf.mu.Unlock()
 		}
 	}
+}
+
+/*returns true if a log entry is due to be committed, otherwise false*/
+func commitEntry(rf *Raft, N int) bool {
+	rf.mu.Lock()
+	commitIdx := rf.commitIndex
+	log := rf.log
+	term := rf.currentTerm
+	totalPeers := len(rf.peers)
+	rf.mu.Unlock()
+
+	if N > commitIdx {
+		count := 0
+
+		rf.mu.Lock()
+		for i := 0; i < totalPeers; i++ {
+			if rf.matchIndex[i] >= N {
+				count++
+			}
+		}
+		rf.mu.Unlock()
+
+		if (log[N].Term == term) && (count > totalPeers/2) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func validateVote(lastLogIndex1, lastLogIndex2, lastLogTerm1, lastLogTerm2 int) bool {
@@ -316,14 +347,17 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		rf.mu.Lock()
 		rf.currentTerm = args.Term
 		rf.state = "follower"
-		rf.votedFor = args.CandidateID
 		rf.mu.Unlock()
 
 		// check if log atleast up-to-date as its own
 		validate := validateVote(args.LastLogIndex, lastLogIndex, args.LastLogTerm, lastLogTerm)
+
 		if (votedFor == -1 || votedFor == args.CandidateID) && validate {
 			rf.voteRequested <- -1
 			reply.VoteGranted = true
+			rf.mu.Lock()
+			rf.votedFor = args.CandidateID
+			rf.mu.Unlock()
 		}
 	}
 }
@@ -341,7 +375,6 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		reply.Success = false
 
 	} else {
-		// heartBeat received
 		rf.mu.Lock()
 		rf.currentTerm = args.Term
 		rf.state = "follower"
@@ -413,10 +446,6 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 		}
 		rf.mu.Unlock()
 
-	} else {
-		rf.mu.Lock()
-		rf.state = "follower"
-		rf.mu.Unlock()
 	}
 
 	return ok
@@ -517,7 +546,9 @@ func handleElection(rf *Raft, me int) {
 
 /*election process conducted upon leader failure*/
 func election(rf *Raft) {
+
 	rf.mu.Lock()
+	rf.voteCount = 0
 	rf.currentTerm += 1
 	term := rf.currentTerm
 	rf.voteCount += 1
@@ -556,9 +587,9 @@ func election(rf *Raft) {
 
 			if status > (totalPeers / 2) {
 				// become Leader
-				rf.mu.Lock()
 				drainQueue(rf.requestQueue)
 
+				rf.mu.Lock()
 				// reinitialize after election
 				for i := 0; i < len(rf.peers); i++ {
 					if i == rf.me {
@@ -575,6 +606,7 @@ func election(rf *Raft) {
 				}
 
 				rf.state = "leader"
+				fmt.Println(rf.me, "is the new leader!")
 				rf.votedFor = -1
 				rf.mu.Unlock()
 
@@ -583,10 +615,6 @@ func election(rf *Raft) {
 			}
 		}
 	}
-
-	rf.mu.Lock()
-	rf.voteCount = 0
-	rf.mu.Unlock()
 }
 
 /*utility functions*/
