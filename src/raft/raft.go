@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -161,7 +160,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.state == "leader" {
 		// add entry to log
 		rf.log = append(rf.log, LogEntry{command, rf.currentTerm})
-		fmt.Println(rf.me, "original log", rf.log)
 
 		return len(rf.log) - 1, rf.currentTerm, true
 
@@ -213,18 +211,16 @@ func (rf *Raft) commitEntries() {
 	currentTerm := rf.currentTerm
 	rf.mu.Unlock()
 
-	//fmt.Println("IN")
-
 	for N := commitIdx + 1; N < len(log); N++ {
 		count := 1
 
-		for i := 0; i < totalPeers-1; i++ {
-			if matchIdx[i] >= N {
+		for i := 0; i < totalPeers; i++ {
+			if i != rf.me && matchIdx[i] >= N && (log[N].Term == currentTerm) {
 				count++
 			}
 		}
 
-		if (count > totalPeers/2) && (log[N].Term == currentTerm) {
+		if count > totalPeers/2 {
 			rf.mu.Lock()
 			rf.commitIndex = N
 			rf.mu.Unlock()
@@ -345,7 +341,6 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		rf.commitIndex = min(args.LeaderCommit, len(log)-1)
 	}
 
-	//fmt.Println("follower log:", rf.log)
 	rf.mu.Unlock()
 
 	rf.commitCh <- 1
@@ -408,7 +403,6 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 
 /*append entries rpc sent and reply handled*/
 func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	//fmt.Println("log sent for replication", args.Entries)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 
 	// handle appendEntries reply from a node
@@ -441,6 +435,7 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 
 		// update matchIndex and nextIndex on success
 		rf.mu.Lock()
+
 		if rf.matchIndex[server] < len(args.Entries)-1 {
 			rf.matchIndex[server] = len(args.Entries) - 1
 		}
@@ -551,7 +546,6 @@ func handleElection(rf *Raft, me int) {
 /*election process conducted upon leader failure*/
 func election(rf *Raft) {
 	rf.mu.Lock()
-	fmt.Println("node:", rf.me, "term:", rf.currentTerm)
 	rf.voteCount = 1
 	rf.currentTerm += 1
 	term := rf.currentTerm
