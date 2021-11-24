@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -121,7 +120,11 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// spawn necessary goroutines
 	go handleElection(rf, me)
 	go rf.requestHandler(applyCh)
+<<<<<<< HEAD
 	// go rf.applyHandler(applyCh)
+=======
+	go rf.applyHandler(applyCh)
+>>>>>>> d3011f382fb2c707bab85ee3807b5c36ea7516d9
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -171,22 +174,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 }
 
+<<<<<<< HEAD
 // /*periodically checks if a value is committed and in which case dispatches it through applyCh*/
 // func (rf *Raft) applyHandler(applyCh chan ApplyMsg) {
 // 	for {
 
 // 	}
 // }
-
-/*handles client request (agreement on new log entry)*/
-func (rf *Raft) requestHandler(applyCh chan ApplyMsg) {
+=======
+/*periodically checks if a value is committed and in which case dispatches it through applyCh*/
+func (rf *Raft) applyHandler(applyCh chan ApplyMsg) {
 	for {
-		// apply
-		<-rf.commitCh
-
 		rf.mu.Lock()
-		lastAppl := rf.lastApplied
 		commitIdx := rf.commitIndex
+		lastAppl := rf.lastApplied
 		log := rf.log
 		rf.mu.Unlock()
 
@@ -197,8 +198,61 @@ func (rf *Raft) requestHandler(applyCh chan ApplyMsg) {
 			lastAppl = rf.lastApplied
 			rf.mu.Unlock()
 
+			applyCh <- ApplyMsg{lastAppl, log[lastAppl].Command, false, make([]byte, 0)}
+		}
+	}
+}
+>>>>>>> d3011f382fb2c707bab85ee3807b5c36ea7516d9
+
+/*handles client request (agreement on new log entry)*/
+func (rf *Raft) requestHandler(applyCh chan ApplyMsg) {
+	for {
+		// apply
+		<-rf.commitCh
+
+		rf.mu.Lock()
+<<<<<<< HEAD
+		lastAppl := rf.lastApplied
+		commitIdx := rf.commitIndex
+		log := rf.log
+		rf.mu.Unlock()
+
+		// apply log entry if it has been committed
+		if commitIdx > lastAppl {
+=======
+		term := rf.currentTerm
+		entry := LogEntry{newReq.command, term}
+		rf.log = append(rf.log, entry)
+		log := copySlice(rf.log)
+		totalPeers := len(rf.peers)
+		commitIdx := rf.commitIndex
+		me := rf.me
+
+		rf.mu.Unlock()
+
+		// replicate new entry
+		storeReplies := make([]*AppendEntriesReply, totalPeers)
+
+		// send append entries
+		for i := 0; i < totalPeers; i++ {
+>>>>>>> d3011f382fb2c707bab85ee3807b5c36ea7516d9
+			rf.mu.Lock()
+			rf.lastApplied++
+			lastAppl = rf.lastApplied
+			rf.mu.Unlock()
+
+<<<<<<< HEAD
 			fmt.Println("HERE")
 			applyCh <- ApplyMsg{lastAppl, log[lastAppl].Command, false, make([]byte, 0)}
+=======
+			if (i != rf.me) && (len(log)-1 >= nextIndex) {
+				storeReplies[i] = new(AppendEntriesReply)
+
+				prevLogIndex := nextIndex - 1
+				Args := AppendEntriesArgs{term, me, prevLogIndex, log[prevLogIndex].Term, log, commitIdx}
+				go rf.sendAppendEntries(i, Args, storeReplies[i])
+			}
+>>>>>>> d3011f382fb2c707bab85ee3807b5c36ea7516d9
 		}
 	}
 }
@@ -213,7 +267,11 @@ func (rf *Raft) commitEntries() {
 	rf.mu.Unlock()
 
 	for N := commitIdx + 1; N < len(log); N++ {
+<<<<<<< HEAD
 		count := 1
+=======
+		count := 0
+>>>>>>> d3011f382fb2c707bab85ee3807b5c36ea7516d9
 
 		for i := 0; i < totalPeers && i != rf.me; i++ {
 			if (matchIdx[i] >= N) && (log[N].Term == currentTerm) {
@@ -221,7 +279,11 @@ func (rf *Raft) commitEntries() {
 			}
 		}
 
+<<<<<<< HEAD
 		if count > totalPeers/2 {
+=======
+		if count >= totalPeers/2 {
+>>>>>>> d3011f382fb2c707bab85ee3807b5c36ea7516d9
 			rf.mu.Lock()
 			rf.commitIndex = N
 			rf.mu.Unlock()
@@ -343,10 +405,14 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	}
 	rf.mu.Unlock()
 
+<<<<<<< HEAD
 	rf.commitCh <- 1
 
 	reply.Success = true
 
+=======
+	reply.Success = true
+>>>>>>> d3011f382fb2c707bab85ee3807b5c36ea7516d9
 }
 
 /*gets the latest index on which there is agreement*/
@@ -358,6 +424,7 @@ func consistencyCheck(followerLog, leaderLog []LogEntry, prevLogIndex, lastLogIn
 
 	return prevLogIndex
 }
+<<<<<<< HEAD
 
 /*truncates follower log if required and adds entries*/
 func modifyLog(followerLog, leaderLog []LogEntry, prevLogIndex int) []LogEntry {
@@ -370,6 +437,20 @@ func modifyLog(followerLog, leaderLog []LogEntry, prevLogIndex int) []LogEntry {
 			break
 		}
 
+=======
+
+/*truncates follower log if required and adds entries*/
+func modifyLog(followerLog, leaderLog []LogEntry, prevLogIndex int) []LogEntry {
+	llogSize := len(leaderLog)
+	flogSize := len(followerLog)
+
+	i, j := prevLogIndex+1, prevLogIndex+1
+	for i < flogSize && j < llogSize {
+		if followerLog[i].Term != leaderLog[j].Term {
+			break
+		}
+
+>>>>>>> d3011f382fb2c707bab85ee3807b5c36ea7516d9
 		i++
 		j++
 	}
@@ -428,23 +509,35 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 			// faiure due to log inconsistency
 			latestMatchingIndex := reply.AgreementIndex
 			Args := AppendEntriesArgs{currentTerm, me, latestMatchingIndex, log[latestMatchingIndex].Term, log, commitIdx}
+<<<<<<< HEAD
 			go rf.sendAppendEntries(server, Args, new(AppendEntriesReply))
+=======
+			reply := AppendEntriesReply{}
+			rf.sendAppendEntries(server, Args, &reply)
+>>>>>>> d3011f382fb2c707bab85ee3807b5c36ea7516d9
 
 			return ok
 		}
 
 		// update matchIndex and nextIndex on success
 		rf.mu.Lock()
+<<<<<<< HEAD
 		if rf.matchIndex[server] < len(args.Entries)-1 {
 			rf.matchIndex[server] = len(args.Entries) - 1
 		}
+=======
+		rf.matchIndex[server] = len(log) - 1
+>>>>>>> d3011f382fb2c707bab85ee3807b5c36ea7516d9
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 		rf.mu.Unlock()
 
 		// commit entries
 		rf.commitEntries()
+<<<<<<< HEAD
 
 		rf.commitCh <- 1
+=======
+>>>>>>> d3011f382fb2c707bab85ee3807b5c36ea7516d9
 	}
 
 	return ok
@@ -484,8 +577,13 @@ func heartBeat(rf *Raft) {
 	for i := 0; i < totalPeers; i++ {
 		if i != rf.me {
 			rf.mu.Lock()
+<<<<<<< HEAD
 			prevLogIndex := rf.matchIndex[i]
 			Args := AppendEntriesArgs{term, rf.me, prevLogIndex, log[prevLogIndex].Term, log, rf.commitIndex}
+=======
+			prevLogIndex := rf.nextIndex[i] - 1
+			Args := AppendEntriesArgs{term, rf.me, prevLogIndex, log[prevLogIndex].Term, log, rf.lastApplied}
+>>>>>>> d3011f382fb2c707bab85ee3807b5c36ea7516d9
 			rf.mu.Unlock()
 
 			go rf.sendAppendEntries(i, Args, &AppendEntriesReply{})
