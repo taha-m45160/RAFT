@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -147,10 +149,40 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+//
+// save Raft's persistent state to stable storage,
+// where it can later be retrieved after a crash and restart.
+// see paper's Figure 2 for a description of what should be persistent.
+//
 func (rf *Raft) persist() {
+	// 	// Your code here.
+	// 	// Example:
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
+// //
+// // restore previously persisted state.
+// //
 func (rf *Raft) readPersist(data []byte) {
+	// 	// Your code here.
+	// 	// Example:
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.log)
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -215,17 +247,19 @@ func (rf *Raft) commitEntries() {
 		count := 1
 
 		for i := 0; i < totalPeers; i++ {
-			if i != rf.me && matchIdx[i] >= N && (log[N].Term == currentTerm) {
+			if i != rf.me && matchIdx[i] >= N {
 				count++
 			}
 		}
 
-		if count > totalPeers/2 {
+		if (count > totalPeers/2) && (log[N].Term == currentTerm) {
 			rf.mu.Lock()
 			rf.commitIndex = N
 			rf.mu.Unlock()
 		}
 	}
+
+	rf.persist()
 }
 
 func validateVote(lastLogIndex1, lastLogIndex2, lastLogTerm1, lastLogTerm2 int) bool {
@@ -261,6 +295,8 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	lastLogTerm := rf.log[lastLogIndex].Term
 	rf.mu.Unlock()
 
+	defer rf.persist()
+
 	// candidate requesting vote has a stale term
 	if args.Term < currentTerm {
 		reply.Term = currentTerm
@@ -293,6 +329,9 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	state := rf.state
 	log := copySlice(rf.log)
 	rf.mu.Unlock()
+
+	defer rf.persist()
+
 	// received appendEntries from old leader
 	// return newer term
 	if currentTerm > args.Term {
@@ -346,7 +385,6 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	rf.commitCh <- 1
 
 	reply.Success = true
-
 }
 
 /*gets the latest index on which there is agreement*/
@@ -381,6 +419,8 @@ func modifyLog(followerLog, leaderLog []LogEntry, prevLogIndex int) []LogEntry {
 func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 
+	defer rf.persist()
+
 	// handle reply for the requested vote
 	if ok {
 		rf.mu.Lock()
@@ -404,6 +444,8 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 /*append entries rpc sent and reply handled*/
 func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+
+	defer rf.persist()
 
 	// handle appendEntries reply from a node
 	if ok {
