@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-/*--------------------------------------Necessary Structs--------------------------------------*/
+/*-------------------------------------------Structures------------------------------------------*/
 
 type ApplyMsg struct {
 	Index       int
@@ -186,30 +186,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 }
 
-/*listens for newly committed values and applies accordingly*/
-func (rf *Raft) applyHandler(applyCh chan ApplyMsg) {
-	for {
-		// apply
-		<-rf.commitCh
-
-		rf.mu.Lock()
-		lastAppl := rf.lastApplied
-		commitIdx := rf.commitIndex
-		log := rf.log
-		rf.mu.Unlock()
-
-		// apply log entry if it has been committed
-		for commitIdx > lastAppl {
-			rf.mu.Lock()
-			rf.lastApplied++
-			lastAppl = rf.lastApplied
-			rf.mu.Unlock()
-
-			applyCh <- ApplyMsg{lastAppl, log[lastAppl].Command, false, make([]byte, 0)}
-		}
-	}
-}
-
 /*---------------------------------------RPC Implementation---------------------------------------*/
 
 func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
@@ -361,6 +337,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	prevLogIndex := args.PrevLogIndex
 	prevLogTerm := args.PrevLogTerm
 
+	// returns latest value at which the leader and follower logs agree
 	consistentAt := checkConsistent(log, args.Entries, prevLogIndex, lastLogIndex, prevLogTerm)
 	if consistentAt != args.PrevLogIndex {
 		reply.Success = false
@@ -379,93 +356,11 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(log)-1)
 	}
-
 	rf.mu.Unlock()
 
 	rf.commitCh <- 1
 
 	reply.Success = true
-}
-
-/*---------------------------------functions for safety checks------------------------------------*/
-
-func validateVote(lastLogIndex1, lastLogIndex2, lastLogTerm1, lastLogTerm2 int) bool {
-	/*
-		returns true if candidate's log is at least
-		as up-to-date as the follower's log
-		otherwise returns false
-
-		Input:
-		1: Candidate
-		2: Follower
-	*/
-
-	if (lastLogTerm1 != lastLogTerm2) && (lastLogTerm1 > lastLogTerm2) {
-		return true
-
-	} else if (lastLogTerm1 == lastLogTerm2) && (lastLogIndex1 >= lastLogIndex2) {
-		return true
-
-	} else {
-		return false
-	}
-}
-
-/*gets the latest index on which there is agreement*/
-func checkConsistent(followerLog, leaderLog []LogEntry, prevLogIndex, lastLogIndex, prevLogTerm int) int {
-	for (prevLogIndex > lastLogIndex) || (followerLog[prevLogIndex].Term != prevLogTerm) {
-		prevLogIndex--
-		prevLogTerm = leaderLog[prevLogIndex].Term
-	}
-
-	return prevLogIndex
-}
-
-/*truncates follower log if required and adds entries*/
-func modifyLog(followerLog, leaderLog []LogEntry, prevLogIndex int) []LogEntry {
-	llogSize := len(leaderLog)
-	flogSize := len(followerLog)
-
-	i, j := prevLogIndex+1, prevLogIndex+1
-	for i < flogSize && j < llogSize {
-		if followerLog[i].Term != leaderLog[j].Term {
-			break
-		}
-
-		i++
-		j++
-	}
-
-	return append(followerLog[:i], leaderLog[j:]...)
-}
-
-/*changes the commit index of the leader if a command has been replicated on a majority of nodes*/
-func (rf *Raft) commitEntries() {
-	rf.mu.Lock()
-	log := copySlice(rf.log)
-	matchIdx := copyMap(rf.matchIndex)
-	commitIdx := rf.commitIndex
-	totalPeers := len(rf.peers)
-	currentTerm := rf.currentTerm
-	rf.mu.Unlock()
-
-	for N := commitIdx + 1; N < len(log); N++ {
-		count := 1
-
-		for i := 0; i < totalPeers; i++ {
-			if i != rf.me && matchIdx[i] >= N {
-				count++
-			}
-		}
-
-		if (count > totalPeers/2) && (currentTerm == log[N].Term) {
-			rf.mu.Lock()
-			rf.commitIndex = N
-			rf.mu.Unlock()
-		}
-	}
-
-	rf.persist()
 }
 
 /*----------------------------------------Leader Election-----------------------------------------*/
@@ -628,7 +523,114 @@ func election(rf *Raft) {
 	}
 }
 
-/*----------------------------------------utility functions---------------------------------------*/
+/*---------------------------------Log Replication & Safety--------------------------------------*/
+
+func validateVote(lastLogIndex1, lastLogIndex2, lastLogTerm1, lastLogTerm2 int) bool {
+	/*
+		returns true if candidate's log is at least
+		as up-to-date as the follower's log
+		otherwise returns false
+
+		Input:
+		1: Candidate
+		2: Follower
+	*/
+
+	if (lastLogTerm1 != lastLogTerm2) && (lastLogTerm1 > lastLogTerm2) {
+		return true
+
+	} else if (lastLogTerm1 == lastLogTerm2) && (lastLogIndex1 >= lastLogIndex2) {
+		return true
+
+	} else {
+		return false
+	}
+}
+
+/*gets the latest index on which there is agreement*/
+func checkConsistent(followerLog, leaderLog []LogEntry, prevLogIndex, lastLogIndex, prevLogTerm int) int {
+	for (prevLogIndex > lastLogIndex) || (followerLog[prevLogIndex].Term != prevLogTerm) {
+		prevLogIndex--
+		prevLogTerm = leaderLog[prevLogIndex].Term
+	}
+
+	return prevLogIndex
+}
+
+/*truncates follower log if required and adds entries*/
+func modifyLog(followerLog, leaderLog []LogEntry, prevLogIndex int) []LogEntry {
+	llogSize := len(leaderLog)
+	flogSize := len(followerLog)
+
+	i, j := prevLogIndex+1, prevLogIndex+1
+	for i < flogSize && j < llogSize {
+		if followerLog[i].Term != leaderLog[j].Term {
+			break
+		}
+
+		i++
+		j++
+	}
+
+	return append(followerLog[:i], leaderLog[j:]...)
+}
+
+/*changes the commit index of the leader if a command has been replicated on a majority of nodes*/
+func (rf *Raft) commitEntries() {
+	rf.mu.Lock()
+	log := copySlice(rf.log)
+	matchIdx := copyMap(rf.matchIndex)
+	commitIdx := rf.commitIndex
+	totalPeers := len(rf.peers)
+	currentTerm := rf.currentTerm
+	rf.mu.Unlock()
+
+	for N := commitIdx + 1; N < len(log); N++ {
+		count := 1
+
+		for i := 0; i < totalPeers; i++ {
+			if i != rf.me && matchIdx[i] >= N {
+				count++
+			}
+		}
+
+		if (count > totalPeers/2) && (currentTerm == log[N].Term) {
+			rf.mu.Lock()
+			rf.commitIndex = N
+			rf.mu.Unlock()
+		}
+	}
+
+	rf.persist()
+}
+
+/*----------------------------------Applying to State Machine-------------------------------------*/
+
+/*waits for newly committed values and applies accordingly*/
+func (rf *Raft) applyHandler(applyCh chan ApplyMsg) {
+	for {
+		// apply
+		<-rf.commitCh
+
+		rf.mu.Lock()
+		lastAppl := rf.lastApplied
+		commitIdx := rf.commitIndex
+		log := rf.log
+		rf.mu.Unlock()
+
+		// apply log entry if it has been committed
+		for commitIdx > lastAppl {
+			rf.mu.Lock()
+			rf.lastApplied++
+			lastAppl = rf.lastApplied
+			rf.mu.Unlock()
+
+			applyCh <- ApplyMsg{lastAppl, log[lastAppl].Command, false, make([]byte, 0)}
+		}
+	}
+}
+
+/*--------------------------------------------Utility---------------------------------------------*/
 func min(a, b int) int {
 	if a < b {
 		return a
