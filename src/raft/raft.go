@@ -186,6 +186,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 }
 
+func (rf *Raft) Kill() {
+
+}
+
 /*---------------------------------------RPC Implementation---------------------------------------*/
 
 func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
