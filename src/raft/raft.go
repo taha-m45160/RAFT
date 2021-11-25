@@ -252,7 +252,7 @@ func (rf *Raft) commitEntries() {
 			}
 		}
 
-		if (count > totalPeers/2) && (log[N].Term == currentTerm) {
+		if count > totalPeers/2 && (currentTerm == log[N].Term) {
 			rf.mu.Lock()
 			rf.commitIndex = N
 			rf.mu.Unlock()
@@ -273,13 +273,10 @@ func validateVote(lastLogIndex1, lastLogIndex2, lastLogTerm1, lastLogTerm2 int) 
 		2: Follower
 	*/
 
-	if lastLogTerm1 > lastLogTerm2 {
+	if (lastLogTerm1 != lastLogTerm2) && (lastLogTerm1 > lastLogTerm2) {
 		return true
 
-	} else if lastLogTerm1 < lastLogTerm2 {
-		return false
-
-	} else if lastLogIndex1 >= lastLogIndex2 {
+	} else if (lastLogTerm1 == lastLogTerm2) && (lastLogIndex1 >= lastLogIndex2) {
 		return true
 
 	} else {
@@ -315,6 +312,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 
 		if (votedFor == -1 || votedFor == args.CandidateID) && validate {
 			rf.voteRequested <- -1
+			//fmt.Println("Vote Requested by", args.CandidateID, "GRANTED by", rf.me, "----->", args.LastLogIndex, lastLogIndex, args.LastLogTerm, lastLogTerm)
 			reply.VoteGranted = true
 			rf.mu.Lock()
 			rf.votedFor = args.CandidateID
@@ -325,6 +323,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+	//fmt.Println("heartbeat received at:", rf.me, "from", args.LeaderID, "TERM", args.Term)
 	currentTerm := rf.currentTerm
 	state := rf.state
 	log := copySlice(rf.log)
@@ -337,6 +336,8 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	if currentTerm > args.Term {
 		reply.Term = currentTerm
 		reply.Success = false
+
+		//fmt.Println("returns")
 
 		return
 	}
@@ -417,6 +418,9 @@ func modifyLog(followerLog, leaderLog []LogEntry, prevLogIndex int) []LogEntry {
 
 /*request vote rpc sent and reply handled*/
 func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
+	// rf.mu.Lock()
+	// fmt.Println(rf.me, "requesting vote with log:", rf.log)
+	// rf.mu.Unlock()
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 
 	defer rf.persist()
@@ -458,7 +462,7 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 
 		if !reply.Success {
 			// failure due to term inconsistency
-			if currentTerm < reply.Term {
+			if args.Term < reply.Term {
 				rf.mu.Lock()
 				rf.currentTerm = reply.Term
 				rf.state = "follower"
@@ -643,6 +647,7 @@ func election(rf *Raft) {
 				}
 
 				rf.state = "leader"
+				//fmt.Println("leader:", rf.me)
 				rf.votedFor = -1
 				rf.mu.Unlock()
 
